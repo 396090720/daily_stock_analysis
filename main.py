@@ -45,13 +45,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from src.config import get_config, Config
-from src.feishu_doc import FeishuDocManager
 from src.logging_config import setup_logging
-from src.notification import NotificationService
-from src.core.pipeline import StockAnalysisPipeline
-from src.core.market_review import run_market_review
-from src.search_service import SearchService
-from src.analyzer import GeminiAnalyzer
 
 
 logger = logging.getLogger(__name__)
@@ -133,13 +127,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         '--webui',
         action='store_true',
-        help='启动本地配置 WebUI（旧版 Gradio）'
+        help='启动 Web 管理界面'
     )
 
     parser.add_argument(
         '--webui-only',
         action='store_true',
-        help='仅启动 WebUI 服务，不自动执行分析'
+        help='仅启动 Web 服务，不执行自动分析'
     )
 
     parser.add_argument(
@@ -174,6 +168,33 @@ def parse_arguments() -> argparse.Namespace:
         help='不保存分析上下文快照'
     )
 
+    # === Backtest ===
+    parser.add_argument(
+        '--backtest',
+        action='store_true',
+        help='运行回测（对历史分析结果进行评估）'
+    )
+
+    parser.add_argument(
+        '--backtest-code',
+        type=str,
+        default=None,
+        help='仅回测指定股票代码'
+    )
+
+    parser.add_argument(
+        '--backtest-days',
+        type=int,
+        default=None,
+        help='回测评估窗口（交易日数，默认使用配置）'
+    )
+
+    parser.add_argument(
+        '--backtest-force',
+        action='store_true',
+        help='强制回测（即使已有回测结果也重新计算）'
+    )
+
     return parser.parse_args()
 
 
@@ -188,6 +209,9 @@ def run_full_analysis(
     这是定时任务调用的主函数
     """
     try:
+        from src.core.pipeline import StockAnalysisPipeline
+        from src.core.market_review import run_market_review
+
         # 命令行参数 --single-notify 覆盖配置（#55）
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
@@ -246,6 +270,8 @@ def run_full_analysis(
 
         # === 新增：生成飞书云文档 ===
         try:
+            from src.feishu_doc import FeishuDocManager
+
             feishu_doc = FeishuDocManager()
             if feishu_doc.is_configured() and (results or market_report):
                 logger.info("正在创建飞书云文档...")
@@ -277,6 +303,26 @@ def run_full_analysis(
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
+
+        # === Auto backtest ===
+        try:
+            if getattr(config, 'backtest_enabled', False):
+                from src.services.backtest_service import BacktestService
+
+                logger.info("开始自动回测...")
+                service = BacktestService()
+                stats = service.run_backtest(
+                    force=False,
+                    eval_window_days=getattr(config, 'backtest_eval_window_days', 10),
+                    min_age_days=getattr(config, 'backtest_min_age_days', 14),
+                    limit=200,
+                )
+                logger.info(
+                    f"自动回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
+                    f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
+                )
+        except Exception as e:
+            logger.warning(f"自动回测失败（已忽略）: {e}")
 
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
@@ -374,22 +420,27 @@ def main() -> int:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
     
-    # === 启动 WebUI (如果启用) ===
-    # 优先级: 命令行参数 > 配置文件
-    start_webui = (args.webui or args.webui_only or config.webui_enabled) and os.getenv("GITHUB_ACTIONS") != "true"
+    # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
+    if args.webui:
+        args.serve = True
+    if args.webui_only:
+        args.serve_only = True
+
+    # 兼容旧版 WEBUI_ENABLED 环境变量
+    if config.webui_enabled and not (args.serve or args.serve_only):
+        args.serve = True
+
+    # === 启动 Web 服务 (如果启用) ===
+    start_serve = (args.serve or args.serve_only) and os.getenv("GITHUB_ACTIONS") != "true"
+
+    # 兼容旧版 WEBUI_HOST/WEBUI_PORT：如果用户未通过 --host/--port 指定，则使用旧变量
+    if start_serve:
+        if args.host == '0.0.0.0' and os.getenv('WEBUI_HOST'):
+            args.host = os.getenv('WEBUI_HOST')
+        if args.port == 8000 and os.getenv('WEBUI_PORT'):
+            args.port = int(os.getenv('WEBUI_PORT'))
     
     bot_clients_started = False
-    if start_webui:
-        try:
-            from webui import run_server_in_thread
-            run_server_in_thread(host=config.webui_host, port=config.webui_port)
-            bot_clients_started = True
-        except Exception as e:
-            logger.error(f"启动 WebUI 失败: {e}")
-    
-    # === 启动 FastAPI 服务 (如果启用) ===
-    start_serve = (args.serve or args.serve_only) and os.getenv("GITHUB_ACTIONS") != "true"
-    
     if start_serve:
         try:
             start_api_server(host=args.host, port=args.port, config=config)
@@ -400,23 +451,10 @@ def main() -> int:
     if bot_clients_started:
         start_bot_stream_clients(config)
     
-    # === 仅 WebUI 模式：不自动执行分析 ===
-    if args.webui_only:
-        logger.info("模式: 仅 WebUI 服务")
-        logger.info(f"WebUI 运行中: http://{config.webui_host}:{config.webui_port}")
-        logger.info("通过 /analysis?code=xxx 接口手动触发分析")
-        logger.info("按 Ctrl+C 退出...")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("\n用户中断，程序退出")
-        return 0
-    
-    # === 仅 FastAPI 服务模式：不自动执行分析 ===
+    # === 仅 Web 服务模式：不自动执行分析 ===
     if args.serve_only:
-        logger.info("模式: 仅 FastAPI 服务")
-        logger.info(f"API 服务运行中: http://{args.host}:{args.port}")
+        logger.info("模式: 仅 Web 服务")
+        logger.info(f"Web 服务运行中: http://{args.host}:{args.port}")
         logger.info("通过 /api/v1/analysis/stock/{code} 接口触发分析")
         logger.info(f"API 文档: http://{args.host}:{args.port}/docs")
         logger.info("按 Ctrl+C 退出...")
@@ -428,8 +466,30 @@ def main() -> int:
         return 0
 
     try:
+        # 模式0: 回测
+        if getattr(args, 'backtest', False):
+            logger.info("模式: 回测")
+            from src.services.backtest_service import BacktestService
+
+            service = BacktestService()
+            stats = service.run_backtest(
+                code=getattr(args, 'backtest_code', None),
+                force=getattr(args, 'backtest_force', False),
+                eval_window_days=getattr(args, 'backtest_days', None),
+            )
+            logger.info(
+                f"回测完成: processed={stats.get('processed')} saved={stats.get('saved')} "
+                f"completed={stats.get('completed')} insufficient={stats.get('insufficient')} errors={stats.get('errors')}"
+            )
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
+            from src.analyzer import GeminiAnalyzer
+            from src.core.market_review import run_market_review
+            from src.notification import NotificationService
+            from src.search_service import SearchService
+
             logger.info("模式: 仅大盘复盘")
             notifier = NotificationService()
             
@@ -484,10 +544,9 @@ def main() -> int:
         logger.info("\n程序执行完成")
         
         # 如果启用了服务且是非定时任务模式，保持程序运行
-        keep_running = (start_webui or start_serve) and not (args.schedule or config.schedule_enabled)
+        keep_running = start_serve and not (args.schedule or config.schedule_enabled)
         if keep_running:
-            service_name = "API 服务" if start_serve else "WebUI"
-            logger.info(f"{service_name} 运行中 (按 Ctrl+C 退出)...")
+            logger.info("API 服务运行中 (按 Ctrl+C 退出)...")
             try:
                 while True:
                     time.sleep(1)

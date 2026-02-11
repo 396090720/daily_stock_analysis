@@ -36,6 +36,28 @@ from api.v1.schemas.stocks import (
     StockHistoryResponse,
     KLineData,
 )
+from api.v1.schemas.backtest import (
+    BacktestRunRequest,
+    BacktestRunResponse,
+    BacktestResultItem,
+    BacktestResultsResponse,
+    PerformanceMetrics,
+)
+from api.v1.schemas.system_config import (
+    SystemConfigFieldSchema,
+    SystemConfigCategorySchema,
+    SystemConfigSchemaResponse,
+    SystemConfigItem,
+    SystemConfigResponse,
+    SystemConfigUpdateItem,
+    UpdateSystemConfigRequest,
+    UpdateSystemConfigResponse,
+    ValidateSystemConfigRequest,
+    ConfigValidationIssue,
+    ValidateSystemConfigResponse,
+    SystemConfigValidationErrorResponse,
+    SystemConfigConflictResponse,
+)
 
 __all__ = [
     # common
@@ -62,4 +84,24 @@ __all__ = [
     "StockQuote",
     "StockHistoryResponse",
     "KLineData",
+    # backtest
+    "BacktestRunRequest",
+    "BacktestRunResponse",
+    "BacktestResultItem",
+    "BacktestResultsResponse",
+    "PerformanceMetrics",
+    # system config
+    "SystemConfigFieldSchema",
+    "SystemConfigCategorySchema",
+    "SystemConfigSchemaResponse",
+    "SystemConfigItem",
+    "SystemConfigResponse",
+    "SystemConfigUpdateItem",
+    "UpdateSystemConfigRequest",
+    "UpdateSystemConfigResponse",
+    "ValidateSystemConfigRequest",
+    "ConfigValidationIssue",
+    "ValidateSystemConfigResponse",
+    "SystemConfigValidationErrorResponse",
+    "SystemConfigConflictResponse",
 ]

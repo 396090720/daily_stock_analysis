@@ -38,6 +38,42 @@ logger = logging.getLogger(__name__)
 STANDARD_COLUMNS = ['date', 'open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
 
 
+def normalize_stock_code(stock_code: str) -> str:
+    """
+    Normalize stock code by stripping exchange prefixes/suffixes.
+
+    Accepted formats and their normalized results:
+    - '600519'      -> '600519'   (already clean)
+    - 'SH600519'    -> '600519'   (strip SH prefix)
+    - 'SZ000001'    -> '000001'   (strip SZ prefix)
+    - 'sh600519'    -> '600519'   (case-insensitive)
+    - '600519.SH'   -> '600519'   (strip .SH suffix)
+    - '000001.SZ'   -> '000001'   (strip .SZ suffix)
+    - 'HK00700'     -> 'HK00700'  (keep HK prefix for HK stocks)
+    - 'AAPL'        -> 'AAPL'     (keep US stock ticker as-is)
+
+    This function is applied at the DataProviderManager layer so that
+    all individual fetchers receive a clean 6-digit code (for A-shares/ETFs).
+    """
+    code = stock_code.strip()
+    upper = code.upper()
+
+    # Strip SH/SZ prefix (e.g. SH600519 -> 600519)
+    if upper.startswith(('SH', 'SZ')) and not upper.startswith('SH.') and not upper.startswith('SZ.'):
+        candidate = code[2:]
+        # Only strip if the remainder looks like a valid numeric code
+        if candidate.isdigit() and len(candidate) in (5, 6):
+            return candidate
+
+    # Strip .SH/.SZ suffix (e.g. 600519.SH -> 600519)
+    if '.' in code:
+        base, suffix = code.rsplit('.', 1)
+        if suffix.upper() in ('SH', 'SZ', 'SS') and base.isdigit():
+            return base
+
+    return code
+
+
 class DataFetchError(Exception):
     """数据获取异常基类"""
     pass
@@ -381,6 +417,9 @@ class DataFetcherManager:
         Raises:
             DataFetchError: 所有数据源都失败时抛出
         """
+        # Normalize code (strip SH/SZ prefix etc.)
+        stock_code = normalize_stock_code(stock_code)
+
         errors = []
         
         for fetcher in self._fetchers:
@@ -433,6 +472,9 @@ class DataFetcherManager:
         Returns:
             预取的股票数量（0 表示跳过预取）
         """
+        # Normalize all codes
+        stock_codes = [normalize_stock_code(c) for c in stock_codes]
+
         from src.config import get_config
         
         config = get_config()
@@ -505,6 +547,9 @@ class DataFetcherManager:
         Returns:
             UnifiedRealtimeQuote 对象，所有数据源都失败则返回 None
         """
+        # Normalize code (strip SH/SZ prefix etc.)
+        stock_code = normalize_stock_code(stock_code)
+
         from .realtime_types import get_realtime_circuit_breaker
         from .akshare_fetcher import _is_us_code
         from src.config import get_config
@@ -536,6 +581,9 @@ class DataFetcherManager:
         source_priority = config.realtime_source_priority.split(',')
         
         errors = []
+        # primary_quote holds the first successful result; we may supplement
+        # missing fields (volume_ratio, turnover_rate, etc.) from later sources.
+        primary_quote = None
         
         for source in source_priority:
             source = source.strip().lower()
@@ -584,8 +632,28 @@ class DataFetcherManager:
                             break
                 
                 if quote is not None and quote.has_basic_data():
-                    logger.info(f"[实时行情] {stock_code} 成功获取 (来源: {source})")
-                    return quote
+                    if primary_quote is None:
+                        # First successful source becomes primary
+                        primary_quote = quote
+                        logger.info(f"[实时行情] {stock_code} 成功获取 (来源: {source})")
+                        # If all key supplementary fields are present, return early
+                        if not self._quote_needs_supplement(primary_quote):
+                            return primary_quote
+                        # Otherwise, continue to try later sources for missing fields
+                        logger.debug(f"[实时行情] {stock_code} 部分字段缺失，尝试从后续数据源补充")
+                        supplement_attempts = 0
+                    else:
+                        # Supplement missing fields from this source (limit attempts)
+                        supplement_attempts += 1
+                        if supplement_attempts > 1:
+                            logger.debug(f"[实时行情] {stock_code} 补充尝试已达上限，停止继续")
+                            break
+                        merged = self._merge_quote_fields(primary_quote, quote)
+                        if merged:
+                            logger.info(f"[实时行情] {stock_code} 从 {source} 补充了缺失字段: {merged}")
+                        # Stop supplementing once all key fields are filled
+                        if not self._quote_needs_supplement(primary_quote):
+                            break
                     
             except Exception as e:
                 error_msg = f"[{source}] 失败: {str(e)}"
@@ -593,6 +661,10 @@ class DataFetcherManager:
                 errors.append(error_msg)
                 continue
         
+        # Return primary even if some fields are still missing
+        if primary_quote is not None:
+            return primary_quote
+
         # 所有数据源都失败，返回 None（降级兜底）
         if errors:
             logger.warning(f"[实时行情] {stock_code} 所有数据源均失败，降级处理: {'; '.join(errors)}")
@@ -600,7 +672,38 @@ class DataFetcherManager:
             logger.warning(f"[实时行情] {stock_code} 无可用数据源")
         
         return None
-    
+
+    # Fields worth supplementing from secondary sources when the primary
+    # source returns None for them. Ordered by importance.
+    _SUPPLEMENT_FIELDS = [
+        'volume_ratio', 'turnover_rate',
+        'pe_ratio', 'pb_ratio', 'total_mv', 'circ_mv',
+        'amplitude',
+    ]
+
+    @classmethod
+    def _quote_needs_supplement(cls, quote) -> bool:
+        """Check if any key supplementary field is still None."""
+        for f in cls._SUPPLEMENT_FIELDS:
+            if getattr(quote, f, None) is None:
+                return True
+        return False
+
+    @classmethod
+    def _merge_quote_fields(cls, primary, secondary) -> list:
+        """
+        Copy non-None fields from *secondary* into *primary* where
+        *primary* has None. Returns list of field names that were filled.
+        """
+        filled = []
+        for f in cls._SUPPLEMENT_FIELDS:
+            if getattr(primary, f, None) is None:
+                val = getattr(secondary, f, None)
+                if val is not None:
+                    setattr(primary, f, val)
+                    filled.append(f)
+        return filled
+
     def get_chip_distribution(self, stock_code: str):
         """
         获取筹码分布数据（带熔断和多数据源降级）
@@ -617,6 +720,9 @@ class DataFetcherManager:
         Returns:
             ChipDistribution 对象，失败则返回 None
         """
+        # Normalize code (strip SH/SZ prefix etc.)
+        stock_code = normalize_stock_code(stock_code)
+
         from .realtime_types import get_chip_circuit_breaker
         from src.config import get_config
 
@@ -675,6 +781,9 @@ class DataFetcherManager:
         Returns:
             股票中文名称，所有数据源都失败则返回 None
         """
+        # Normalize code (strip SH/SZ prefix etc.)
+        stock_code = normalize_stock_code(stock_code)
+
         # 1. 先检查缓存
         if hasattr(self, '_stock_name_cache') and stock_code in self._stock_name_cache:
             return self._stock_name_cache[stock_code]

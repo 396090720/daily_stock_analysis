@@ -16,7 +16,8 @@ daily_stock_analysis/
 │   └── ...
 ├── data_provider/       # Multi-source data adapters
 ├── bot/                 # Bot interaction module
-├── web/                 # WebUI module
+├── api/                 # FastAPI backend service
+├── apps/dsa-web/        # React frontend
 ├── docker/              # Docker configuration
 ├── docs/                # Project documentation
 └── .github/workflows/   # GitHub Actions
@@ -33,6 +34,7 @@ daily_stock_analysis/
 - [Notification Channel Configuration](#notification-channel-configuration)
 - [Data Source Configuration](#data-source-configuration)
 - [Advanced Features](#advanced-features)
+- [Backtesting](#backtesting)
 - [Local WebUI Management Interface](#local-webui-management-interface)
 
 ---
@@ -270,11 +272,11 @@ services:
     <<: *common
     container_name: stock-analyzer
 
-  # WebUI mode
-  webui:
+  # FastAPI mode
+  server:
     <<: *common
-    container_name: stock-webui
-    command: ["python", "main.py", "--webui-only"]
+    container_name: stock-server
+    command: ["python", "main.py", "--serve-only", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
 ```
@@ -286,21 +288,21 @@ services:
 docker-compose -f ./docker/docker-compose.yml ps
 
 # View logs
-docker-compose -f ./docker/docker-compose.yml logs -f webui
+docker-compose -f ./docker/docker-compose.yml logs -f server
 
 # Stop services
 docker-compose -f ./docker/docker-compose.yml down
 
 # Rebuild image (after code update)
 docker-compose -f ./docker/docker-compose.yml build --no-cache
-docker-compose -f ./docker/docker-compose.yml up -d webui
+docker-compose -f ./docker/docker-compose.yml up -d server
 ```
 
 ### Manual Image Build
 
 ```bash
 docker build -t stock-analysis .
-docker run -d --env-file .env -p 8000:8000 -v ./data:/app/data stock-analysis python main.py --webui-only
+docker run -d --env-file .env -p 8000:8000 -v ./data:/app/data stock-analysis python main.py --serve-only --host 0.0.0.0 --port 8000
 ```
 
 ---
@@ -523,62 +525,129 @@ Log file locations:
 
 ---
 
-## Local WebUI Management Interface
+## Backtesting
 
-WebUI provides configuration management and quick analysis features, supporting single stock analysis triggered from the page.
+The backtesting module automatically validates historical AI analysis records against actual price movements, evaluating the accuracy of analysis recommendations.
+
+### How It Works
+
+1. Selects `AnalysisHistory` records past the cooldown period (default 14 days)
+2. Fetches daily bar data after the analysis date (forward bars)
+3. Infers expected direction from the operation advice and compares against actual movement
+4. Evaluates stop-loss/take-profit hit conditions and simulates execution returns
+5. Aggregates into overall and per-stock performance metrics
+
+### Operation Advice Mapping
+
+| Operation Advice | Position | Expected Direction | Win Condition |
+|-----------------|----------|-------------------|---------------|
+| Buy / Add / Strong Buy | long | up | Return >= neutral band |
+| Sell / Reduce / Strong Sell | cash | down | Decline >= neutral band |
+| Hold | long | not_down | No significant decline |
+| Wait / Observe | cash | flat | Price within neutral band |
+
+### Configuration
+
+Set the following variables in `.env` (all optional, have defaults):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BACKTEST_ENABLED` | `true` | Whether to auto-run backtest after daily analysis |
+| `BACKTEST_EVAL_WINDOW_DAYS` | `10` | Evaluation window (trading days) |
+| `BACKTEST_MIN_AGE_DAYS` | `14` | Only backtest records older than N days to avoid incomplete data |
+| `BACKTEST_ENGINE_VERSION` | `v1` | Engine version, used to distinguish results when logic is updated |
+| `BACKTEST_NEUTRAL_BAND_PCT` | `2.0` | Neutral band threshold (%), ±2% treated as range-bound |
+
+### Auto-run
+
+Backtesting triggers automatically after the daily analysis flow completes (non-blocking; failures do not affect notifications). It can also be triggered manually via API.
+
+### Evaluation Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `direction_accuracy_pct` | Direction prediction accuracy (expected direction matches actual) |
+| `win_rate_pct` | Win rate (wins / (wins + losses), excludes neutral) |
+| `avg_stock_return_pct` | Average stock return percentage |
+| `avg_simulated_return_pct` | Average simulated execution return (including SL/TP exits) |
+| `stop_loss_trigger_rate` | Stop-loss trigger rate (only counts records with SL configured) |
+| `take_profit_trigger_rate` | Take-profit trigger rate (only counts records with TP configured) |
+
+---
+
+## FastAPI API Service
+
+FastAPI provides RESTful API service for configuration management and triggering analysis.
 
 ### Startup Methods
 
 | Command | Description |
 |------|------|
-| `python main.py --webui` | Start WebUI + run full analysis once |
-| `python main.py --webui-only` | Start WebUI only, manually trigger analysis |
-
-**Permanently enable**: Set in `.env`:
-```env
-WEBUI_ENABLED=true
-```
+| `python main.py --serve` | Start API service + run full analysis once |
+| `python main.py --serve-only` | Start API service only, manually trigger analysis |
 
 ### Features
 
-- **Configuration Management** - View/modify watchlist in `.env`
-- **Quick Analysis** - Enter stock code on page, one-click trigger analysis
+- **Configuration Management** - View/modify watchlist
+- **Quick Analysis** - Trigger analysis via API
 - **Real-time Progress** - Analysis task status updates in real-time, supports parallel tasks
-- **API Interface** - Supports programmatic calls
+- **Backtest Validation** - Evaluate historical analysis accuracy, query direction win rate and simulated returns
+- **API Documentation** - Visit `/docs` for Swagger UI
 
 ### API Endpoints
 
 | Endpoint | Method | Description |
 |------|------|------|
-| `/` | GET | Configuration management page |
-| `/health` | GET | Health check |
-| `/analysis?code=xxx` | GET | Trigger async analysis for single stock |
-| `/analysis/history` | GET | Query analysis history |
-| `/tasks` | GET | Query all task statuses |
-| `/task?id=xxx` | GET | Query single task status |
+| `/api/v1/analysis/analyze` | POST | Trigger stock analysis |
+| `/api/v1/analysis/tasks` | GET | Query task list |
+| `/api/v1/analysis/status/{task_id}` | GET | Query task status |
+| `/api/v1/history` | GET | Query analysis history |
+| `/api/v1/backtest/run` | POST | Trigger backtest |
+| `/api/v1/backtest/results` | GET | Query backtest results (paginated) |
+| `/api/v1/backtest/performance` | GET | Get overall backtest performance |
+| `/api/v1/backtest/performance/{code}` | GET | Get per-stock backtest performance |
+| `/api/health` | GET | Health check |
+| `/docs` | GET | API Swagger documentation |
 
 **Usage examples**:
 ```bash
 # Health check
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/api/health
 
 # Trigger analysis (A-shares)
-curl "http://127.0.0.1:8000/analysis?code=600519"
-
-# Trigger analysis (HK stocks)
-curl "http://127.0.0.1:8000/analysis?code=hk00700"
+curl -X POST http://127.0.0.1:8000/api/v1/analysis/analyze \
+  -H 'Content-Type: application/json' \
+  -d '{"stock_code": "600519"}'
 
 # Query task status
-curl "http://127.0.0.1:8000/task?id=<task_id>"
+curl http://127.0.0.1:8000/api/v1/analysis/status/<task_id>
+
+# Trigger backtest (all stocks)
+curl -X POST http://127.0.0.1:8000/api/v1/backtest/run \
+  -H 'Content-Type: application/json' \
+  -d '{"force": false}'
+
+# Trigger backtest (specific stock)
+curl -X POST http://127.0.0.1:8000/api/v1/backtest/run \
+  -H 'Content-Type: application/json' \
+  -d '{"code": "600519", "force": false}'
+
+# Query overall backtest performance
+curl http://127.0.0.1:8000/api/v1/backtest/performance
+
+# Query per-stock backtest performance
+curl http://127.0.0.1:8000/api/v1/backtest/performance/600519
+
+# Paginated backtest results
+curl "http://127.0.0.1:8000/api/v1/backtest/results?page=1&limit=20"
 ```
 
 ### Custom Configuration
 
 Modify default port or allow LAN access:
 
-```env
-WEBUI_HOST=0.0.0.0    # Default 127.0.0.1
-WEBUI_PORT=8888       # Default 8000
+```bash
+python main.py --serve-only --host 0.0.0.0 --port 8888
 ```
 
 ### Supported Stock Code Formats

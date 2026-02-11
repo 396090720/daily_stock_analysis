@@ -14,6 +14,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 3. 使用 tenacity 实现指数退避重试
 """
 
+import json as _json
 import logging
 import re
 import time
@@ -21,6 +22,7 @@ from datetime import datetime
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
+import requests
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -30,10 +32,31 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS
+from .realtime_types import UnifiedRealtimeQuote
 from src.config import get_config
 import os
 
 logger = logging.getLogger(__name__)
+
+
+# ETF code prefixes by exchange
+# Shanghai: 51xxxx, 52xxxx, 56xxxx, 58xxxx
+# Shenzhen: 15xxxx, 16xxxx, 18xxxx
+_ETF_SH_PREFIXES = ('51', '52', '56', '58')
+_ETF_SZ_PREFIXES = ('15', '16', '18')
+_ETF_ALL_PREFIXES = _ETF_SH_PREFIXES + _ETF_SZ_PREFIXES
+
+
+def _is_etf_code(stock_code: str) -> bool:
+    """
+    Check if the code is an ETF fund code.
+
+    ETF code ranges:
+    - Shanghai ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
+    - Shenzhen ETF: 15xxxx, 16xxxx, 18xxxx
+    """
+    code = stock_code.strip().split('.')[0]
+    return code.startswith(_ETF_ALL_PREFIXES) and len(code) == 6
 
 
 def _is_us_code(stock_code: str) -> bool:
@@ -101,17 +124,58 @@ class TushareFetcher(BaseFetcher):
         try:
             import tushare as ts
             
-            # 设置 Token
+            # Set Token
             ts.set_token(config.tushare_token)
             
-            # 获取 API 实例
+            # Get API instance
             self._api = ts.pro_api()
             
+            # Fix: tushare SDK 1.4.x hardcodes api.waditu.com/dataapi which may
+            # be unavailable (503). Monkey-patch the query method to use the
+            # official api.tushare.pro endpoint which posts to root URL.
+            self._patch_api_endpoint(config.tushare_token)
+
             logger.info("Tushare API 初始化成功")
             
         except Exception as e:
             logger.error(f"Tushare API 初始化失败: {e}")
             self._api = None
+
+    def _patch_api_endpoint(self, token: str) -> None:
+        """
+        Patch tushare SDK to use the official api.tushare.pro endpoint.
+
+        The SDK (v1.4.x) hardcodes http://api.waditu.com/dataapi and appends
+        /{api_name} to the URL. That endpoint may return 503, causing silent
+        empty-DataFrame failures. This method replaces the query method to
+        POST directly to http://api.tushare.pro (root URL, no path suffix).
+        """
+        import types
+
+        TUSHARE_API_URL = "http://api.tushare.pro"
+        _token = token
+        _timeout = getattr(self._api, '_DataApi__timeout', 30)
+
+        def patched_query(self_api, api_name, fields='', **kwargs):
+            req_params = {
+                'api_name': api_name,
+                'token': _token,
+                'params': kwargs,
+                'fields': fields,
+            }
+            res = requests.post(TUSHARE_API_URL, json=req_params, timeout=_timeout)
+            if res.status_code != 200:
+                raise Exception(f"Tushare API HTTP {res.status_code}")
+            result = _json.loads(res.text)
+            if result['code'] != 0:
+                raise Exception(result['msg'])
+            data = result['data']
+            columns = data['fields']
+            items = data['items']
+            return pd.DataFrame(items, columns=columns)
+
+        self._api.query = types.MethodType(patched_query, self._api)
+        logger.debug(f"Tushare API endpoint patched to {TUSHARE_API_URL}")
 
     def _determine_priority(self) -> int:
         """
@@ -190,30 +254,37 @@ class TushareFetcher(BaseFetcher):
         转换股票代码为 Tushare 格式
         
         Tushare 要求的格式：
-        - 沪市：600519.SH
-        - 深市：000001.SZ
+        - 沪市股票：600519.SH
+        - 深市股票：000001.SZ
+        - 沪市 ETF：510050.SH, 563230.SH
+        - 深市 ETF：159919.SZ
         
         Args:
-            stock_code: 原始代码，如 '600519', '000001'
+            stock_code: 原始代码，如 '600519', '000001', '563230'
             
         Returns:
-            Tushare 格式代码，如 '600519.SH', '000001.SZ'
+            Tushare 格式代码，如 '600519.SH', '000001.SZ', '563230.SH'
         """
         code = stock_code.strip()
         
-        # 已经包含后缀的情况
+        # Already has suffix
         if '.' in code:
             return code.upper()
         
-        # 根据代码前缀判断市场
-        # 沪市：600xxx, 601xxx, 603xxx, 688xxx (科创板)
-        # 深市：000xxx, 002xxx, 300xxx (创业板)
+        # ETF: determine exchange by prefix
+        if code.startswith(_ETF_SH_PREFIXES) and len(code) == 6:
+            return f"{code}.SH"
+        if code.startswith(_ETF_SZ_PREFIXES) and len(code) == 6:
+            return f"{code}.SZ"
+        
+        # Regular stocks
+        # Shanghai: 600xxx, 601xxx, 603xxx, 688xxx (STAR Market)
+        # Shenzhen: 000xxx, 002xxx, 300xxx (ChiNext)
         if code.startswith(('600', '601', '603', '688')):
             return f"{code}.SH"
         elif code.startswith(('000', '002', '300')):
             return f"{code}.SZ"
         else:
-            # 默认尝试深市
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
             return f"{code}.SZ"
     
@@ -227,41 +298,53 @@ class TushareFetcher(BaseFetcher):
         """
         从 Tushare 获取原始数据
         
-        使用 daily() 接口获取日线数据
+        根据代码类型选择不同接口：
+        - 普通股票：daily()
+        - ETF 基金：fund_daily()
         
         流程：
         1. 检查 API 是否可用
         2. 检查是否为美股（不支持）
         3. 执行速率限制检查
         4. 转换股票代码格式
-        5. 调用 API 获取数据
+        5. 根据代码类型选择接口并调用
         """
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
         
-        # 美股不支持，抛出异常让 DataFetcherManager 切换到其他数据源
+        # US stocks not supported
         if _is_us_code(stock_code):
             raise DataFetchError(f"TushareFetcher 不支持美股 {stock_code}，请使用 AkshareFetcher 或 YfinanceFetcher")
         
-        # 速率限制检查
+        # Rate-limit check
         self._check_rate_limit()
         
-        # 转换代码格式
+        # Convert code format
         ts_code = self._convert_stock_code(stock_code)
         
-        # 转换日期格式（Tushare 要求 YYYYMMDD）
+        # Convert date format (Tushare requires YYYYMMDD)
         ts_start = start_date.replace('-', '')
         ts_end = end_date.replace('-', '')
         
-        logger.debug(f"调用 Tushare daily({ts_code}, {ts_start}, {ts_end})")
+        is_etf = _is_etf_code(stock_code)
+        api_name = "fund_daily" if is_etf else "daily"
+        logger.debug(f"调用 Tushare {api_name}({ts_code}, {ts_start}, {ts_end})")
         
         try:
-            # 调用 daily 接口获取日线数据
-            df = self._api.daily(
-                ts_code=ts_code,
-                start_date=ts_start,
-                end_date=ts_end,
-            )
+            if is_etf:
+                # ETF uses fund_daily interface
+                df = self._api.fund_daily(
+                    ts_code=ts_code,
+                    start_date=ts_start,
+                    end_date=ts_end,
+                )
+            else:
+                # Regular stocks use daily interface
+                df = self._api.daily(
+                    ts_code=ts_code,
+                    start_date=ts_start,
+                    end_date=ts_end,
+                )
             
             return df
             
@@ -349,11 +432,17 @@ class TushareFetcher(BaseFetcher):
             # 转换代码格式
             ts_code = self._convert_stock_code(stock_code)
             
-            # 调用 stock_basic 接口
-            df = self._api.stock_basic(
-                ts_code=ts_code,
-                fields='ts_code,name'
-            )
+            # ETF uses fund_basic, regular stocks use stock_basic
+            if _is_etf_code(stock_code):
+                df = self._api.fund_basic(
+                    ts_code=ts_code,
+                    fields='ts_code,name'
+                )
+            else:
+                df = self._api.stock_basic(
+                    ts_code=ts_code,
+                    fields='ts_code,name'
+                )
             
             if df is not None and not df.empty:
                 name = df.iloc[0]['name']
@@ -408,7 +497,7 @@ class TushareFetcher(BaseFetcher):
         
         return None
     
-    def get_realtime_quote(self, stock_code: str) -> Optional[dict]:
+    def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情
 
@@ -426,7 +515,7 @@ class TushareFetcher(BaseFetcher):
             return None
 
         from .realtime_types import (
-            UnifiedRealtimeQuote, RealtimeSource,
+            RealtimeSource,
             safe_float, safe_int
         )
 
