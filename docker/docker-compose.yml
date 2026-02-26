@@ -30,8 +30,8 @@ x-common: &common
   environment:
     - TZ=Asia/Shanghai
 
-    # API 服务绑定地址（容器内需要绑定到 0.0.0.0）
-    - API_HOST=0.0.0.0
+    # Web/API service bind address (must be 0.0.0.0 inside container)
+    - WEBUI_HOST=0.0.0.0
     # API_PORT 从 .env 文件读取，无需在此硬编码
 
     # 代理设置（如果需要）
@@ -61,5 +61,6 @@ services:
     <<: *common
     container_name: stock-server
     command: ["python", "main.py", "--serve-only", "--host", "0.0.0.0", "--port", "${API_PORT:-8000}"]
+    # 若使用 network_mode: host，则以下 ports 映射无效，端口由 command 中的 --port 指定
     ports:
       - "${API_PORT:-8000}:${API_PORT:-8000}"
