@@ -58,6 +58,7 @@ class AgentResult:
     total_steps: int = 0
     total_tokens: int = 0
     provider: str = ""
+    model: str = ""                            # comma-separated models used (supports fallback)
     error: Optional[str] = None
 
 
@@ -334,12 +335,8 @@ class AgentExecutor:
             skills_section = f"## 激活的交易策略\n\n{self.skill_instructions}"
         system_prompt = AGENT_SYSTEM_PROMPT.format(skills_section=skills_section)
 
-        # Build tool declarations for all providers
-        tool_decls = {
-            "gemini": self.tool_registry.to_gemini_declarations(),
-            "openai": self.tool_registry.to_openai_tools(),
-            "anthropic": self.tool_registry.to_anthropic_tools(),
-        }
+        # Build tool declarations in OpenAI format (litellm handles all providers)
+        tool_decls = self.tool_registry.to_openai_tools()
 
         # Initialize conversation
         messages: List[Dict[str, Any]] = [
@@ -373,12 +370,8 @@ class AgentExecutor:
             skills_section = f"## 激活的交易策略\n\n{self.skill_instructions}"
         system_prompt = CHAT_SYSTEM_PROMPT.format(skills_section=skills_section)
 
-        # Build tool declarations for all providers
-        tool_decls = {
-            "gemini": self.tool_registry.to_gemini_declarations(),
-            "openai": self.tool_registry.to_openai_tools(),
-            "anthropic": self.tool_registry.to_anthropic_tools(),
-        }
+        # Build tool declarations in OpenAI format (litellm handles all providers)
+        tool_decls = self.tool_registry.to_openai_tools()
 
         # Get conversation history
         session = conversation_manager.get_or_create(session_id)
@@ -416,10 +409,12 @@ class AgentExecutor:
 
         messages.append({"role": "user", "content": message})
 
+        # Persist the user turn immediately so the session appears in history during processing
+        conversation_manager.add_message(session_id, "user", message)
+
         result = self._run_loop(messages, tool_decls, start_time, tool_calls_log, total_tokens, parse_dashboard=False, progress_callback=progress_callback)
 
-        # Always persist the user turn; persist assistant reply (or error note) for context continuity
-        conversation_manager.add_message(session_id, "user", message)
+        # Persist assistant reply (or error note) for context continuity
         if result.success:
             conversation_manager.add_message(session_id, "assistant", result.content)
         else:
@@ -428,8 +423,9 @@ class AgentExecutor:
 
         return result
 
-    def _run_loop(self, messages: List[Dict[str, Any]], tool_decls: Dict[str, Any], start_time: float, tool_calls_log: List[Dict[str, Any]], total_tokens: int, parse_dashboard: bool, progress_callback: Optional[Callable] = None) -> AgentResult:
+    def _run_loop(self, messages: List[Dict[str, Any]], tool_decls: List[Dict[str, Any]], start_time: float, tool_calls_log: List[Dict[str, Any]], total_tokens: int, parse_dashboard: bool, progress_callback: Optional[Callable] = None) -> AgentResult:
         provider_used = ""
+        models_used: List[str] = []
 
         for step in range(self.max_steps):
             logger.info(f"Agent step {step + 1}/{self.max_steps}")
@@ -446,6 +442,9 @@ class AgentExecutor:
             response = self.llm_adapter.call_with_tools(messages, tool_decls)
             provider_used = response.provider
             total_tokens += response.usage.get("total_tokens", 0)
+            m = getattr(response, "model", "") or response.provider
+            if m and m != "error":
+                models_used.append(m)
 
             if response.tool_calls:
                 # LLM wants to call tools
@@ -457,7 +456,12 @@ class AgentExecutor:
                     "role": "assistant",
                     "content": response.content,
                     "tool_calls": [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        {
+                            "id": tc.id,
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                            **({"thought_signature": tc.thought_signature} if tc.thought_signature is not None else {}),
+                        }
                         for tc in response.tool_calls
                     ],
                 }
@@ -533,7 +537,8 @@ class AgentExecutor:
                     progress_callback({"type": "generating", "step": step + 1, "message": "正在生成最终分析..."})
 
                 final_content = response.content or ""
-                
+                model_str = ", ".join(list(dict.fromkeys(x for x in models_used if x))) if models_used else ""
+
                 if parse_dashboard:
                     dashboard = self._parse_dashboard(final_content)
                     return AgentResult(
@@ -544,6 +549,7 @@ class AgentExecutor:
                         total_steps=step + 1,
                         total_tokens=total_tokens,
                         provider=provider_used,
+                        model=model_str,
                         error=None if dashboard else "Failed to parse dashboard JSON from agent response",
                     )
                 else:
@@ -556,6 +562,7 @@ class AgentExecutor:
                             total_steps=step + 1,
                             total_tokens=total_tokens,
                             provider=provider_used,
+                            model=model_str,
                             error=final_content,
                         )
                     return AgentResult(
@@ -566,11 +573,13 @@ class AgentExecutor:
                         total_steps=step + 1,
                         total_tokens=total_tokens,
                         provider=provider_used,
+                        model=model_str,
                         error=None,
                     )
 
         # Max steps exceeded
         logger.warning(f"Agent hit max steps ({self.max_steps})")
+        model_str = ", ".join(list(dict.fromkeys(x for x in models_used if x))) if models_used else ""
         return AgentResult(
             success=False,
             content="",
@@ -578,6 +587,7 @@ class AgentExecutor:
             total_steps=self.max_steps,
             total_tokens=total_tokens,
             provider=provider_used,
+            model=model_str,
             error=f"Agent exceeded max steps ({self.max_steps})",
         )
 

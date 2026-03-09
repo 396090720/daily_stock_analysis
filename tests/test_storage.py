@@ -40,11 +40,26 @@ class TestStorage(unittest.TestCase):
         # 测试多个数字在"元"之前
         self.assertEqual(DatabaseManager._parse_sniper_value("MA5 10 20元"), 20.0)
         
-        # 5. 无效输入
+        # 5. Fallback: no "元" character — extracts last non-MA number
+        self.assertEqual(DatabaseManager._parse_sniper_value("102.10-103.00（MA5附近）"), 103.0)
+        self.assertEqual(DatabaseManager._parse_sniper_value("97.62-98.50（MA10附近）"), 98.5)
+        self.assertEqual(DatabaseManager._parse_sniper_value("93.40下方（MA20支撑）"), 93.4)
+        self.assertEqual(DatabaseManager._parse_sniper_value("108.00-110.00（前期高点阻力）"), 110.0)
+
+        # 6. 无效输入
         self.assertIsNone(DatabaseManager._parse_sniper_value(None))
         self.assertIsNone(DatabaseManager._parse_sniper_value(""))
         self.assertIsNone(DatabaseManager._parse_sniper_value("没有数字"))
         self.assertIsNone(DatabaseManager._parse_sniper_value("MA5但没有元"))
+
+        # 7. 回归：括号内技术指标数字不应被提取
+        self.assertNotEqual(DatabaseManager._parse_sniper_value("1.52-1.53 (回踩MA5/10附近)"), 10.0)
+        self.assertNotEqual(DatabaseManager._parse_sniper_value("1.55-1.56(MA5/M20支撑)"), 20.0)
+        self.assertNotEqual(DatabaseManager._parse_sniper_value("1.49-1.50(MA60附近企稳)"), 60.0)
+        # 验证正确值在区间内
+        self.assertIn(DatabaseManager._parse_sniper_value("1.52-1.53 (回踩MA5/10附近)"), [1.52, 1.53])
+        self.assertIn(DatabaseManager._parse_sniper_value("1.55-1.56(MA5/M20支撑)"), [1.55, 1.56])
+        self.assertIn(DatabaseManager._parse_sniper_value("1.49-1.50(MA60附近企稳)"), [1.49, 1.50])
 
 if __name__ == '__main__':
     unittest.main()

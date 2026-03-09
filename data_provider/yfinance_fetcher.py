@@ -28,7 +28,7 @@ from tenacity import (
     before_sleep_log,
 )
 
-from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS
+from .base import BaseFetcher, DataFetchError, STANDARD_COLUMNS, is_bse_code
 from .realtime_types import UnifiedRealtimeQuote, RealtimeSource
 from .us_index_mapping import get_us_index_yf_symbol, is_us_index_code, is_us_stock_code
 import os
@@ -106,7 +106,7 @@ class YfinanceFetcher(BaseFetcher):
             return f"{hk_code}.HK"
 
         # 已经包含后缀的情况
-        if '.SS' in code or '.SZ' in code or '.HK' in code:
+        if '.SS' in code or '.SZ' in code or '.HK' in code or '.BJ' in code:
             return code
 
         # 去除可能的 .SH 后缀
@@ -118,6 +118,11 @@ class YfinanceFetcher(BaseFetcher):
                 return f"{code}.SS"
             if code.startswith(('15', '16', '18')):
                 return f"{code}.SZ"
+
+        # BSE (Beijing Stock Exchange): 8xxxxx, 4xxxxx, 920xxx
+        if is_bse_code(code):
+            base = code.split('.')[0] if '.' in code else code
+            return f"{base}.BJ"
 
         # A股：根据代码前缀判断市场
         if code.startswith(('600', '601', '603', '688')):
@@ -160,8 +165,16 @@ class YfinanceFetcher(BaseFetcher):
                 end=end_date,
                 progress=False,  # 禁止进度条
                 auto_adjust=True,  # 自动调整价格（复权）
+                multi_level_index=True
             )
             
+            # 筛选出 yf_code 的列, 避免多只股票数据混淆
+            if isinstance(df.columns, pd.MultiIndex) and len(df.columns) > 1:
+                ticker_level = df.columns.get_level_values(1)
+                mask = ticker_level == yf_code
+                if mask.any():
+                    df = df.loc[:, mask].copy()
+                
             if df.empty:
                 raise DataFetchError(f"Yahoo Finance 未查询到 {stock_code} 的数据")
             
