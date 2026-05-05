@@ -41,7 +41,7 @@
 | 分析 | 多維度分析 | 技術面、即時行情、籌碼分布、新聞輿情、公告、資金流與基本面聚合 |
 | 市場 | 全球市場 | 支援 A股、港股、美股、美股指數及常見 ETF |
 | 策略 | 市場策略系統 | 內建 A股復盤、美股 Regime、均線、纏論、波浪、情緒週期等策略能力 |
-| 復盤 | 大盤復盤 | 每日市場概覽、指數表現、漲跌統計與板塊強弱 |
+| 復盤 | 大盤復盤 | 每日市場概覽、指數表現、漲跌統計與板塊強弱（支援 cn / hk / us / both） |
 | Web | 雙主題工作台 | 支援手動分析、配置管理、任務進度、歷史報告、回測、持倉管理 |
 | 匯入 | 智能匯入與補全 | 支援圖片、CSV/Excel、剪貼簿匯入，自選股輸入支援代碼/名稱/拼音/別名補全 |
 | 歷史 | 報告管理 | 支援歷史報告查看、完整 Markdown 報告、重新分析與批量管理 |
@@ -118,7 +118,7 @@
 
 | Secret 名稱 | 說明 | 必填 |
 |-------------|------|:----:|
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/)：中文內容特別優化，可增強 A 股分析效果 | 推薦 |
+| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/)：中文內容特別優化，可增強 A 股分析效果；同一 Key 也可作為 Anspire 大模型網關兜底示例 | 推薦 |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis)：搜尋引擎結果補強，適合即時金融新聞 | 推薦 |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/)：通用新聞搜尋 API | 可選 |
 | `BOCHA_API_KEYS` | [博查搜尋](https://open.bocha.cn/)：中文搜尋優化，支援 AI 摘要 | 可選 |

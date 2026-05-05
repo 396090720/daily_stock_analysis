@@ -41,7 +41,7 @@ English | [简体中文](../README.md) | [繁體中文](README_CHT.md)
 | Analysis | Multi-dimensional Analysis | Technicals, realtime quotes, chip distribution, news sentiment, announcements, capital flow, and fundamentals |
 | Market | Global Markets | A-shares, Hong Kong stocks, US stocks, US indices, and common ETFs |
 | Strategy | Market Strategy System | A-share review, US regime strategy, moving averages, Chan theory, Elliott wave, and sentiment-cycle support |
-| Review | Market Review | Daily market overview, index performance, breadth, and sector strength |
+| Review | Market Review | Daily market overview, index performance, breadth, and sector strength (supports cn / hk / us / both) |
 | Web | Dual-theme Workspace | Manual analysis, settings, task progress, history, backtest, and portfolio management |
 | Import | Smart Import & Autocomplete | Image, CSV/Excel, and clipboard import; search by code, name, pinyin, and aliases |
 | History | Report Management | Full Markdown reports, rerun analysis, history browsing, and batch management |
@@ -118,7 +118,7 @@ News search strongly improves sentiment, announcements, events, and catalyst qua
 
 | Secret Name | Description | Required |
 |-------------|-------------|:--------:|
-| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/), optimized for Chinese content and A-share analysis | Recommended |
+| `ANSPIRE_API_KEYS` | [Anspire AI Search](https://aisearch.anspire.cn/), optimized for Chinese content and A-share analysis; the same key can also be used for Anspire LLM fallback examples | Recommended |
 | `SERPAPI_API_KEYS` | [SerpAPI](https://serpapi.com/baidu-search-api?utm_source=github_daily_stock_analysis), search-engine results for realtime financial news | Recommended |
 | `TAVILY_API_KEYS` | [Tavily](https://tavily.com/), general news search API | Optional |
 | `BOCHA_API_KEYS` | [Bocha](https://open.bocha.cn/), Chinese search with AI summaries | Optional |

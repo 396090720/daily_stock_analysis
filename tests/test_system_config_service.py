@@ -12,7 +12,7 @@ from tests.litellm_stub import ensure_litellm_stub
 
 ensure_litellm_stub()
 
-from src.config import Config
+from src.config import ANSPIRE_LLM_MODEL_DEFAULT, Config
 from src.core.config_manager import ConfigManager
 from src.services.system_config_service import ConfigConflictError, ConfigImportError, SystemConfigService
 
@@ -50,6 +50,11 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.manager = ConfigManager(env_path=self.env_path)
         self.service = SystemConfigService(manager=self.manager)
 
+    @staticmethod
+    def _mock_completion_response(content: str = "OK", tool_calls=None):
+        message = SimpleNamespace(content=content, tool_calls=tool_calls or [])
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
     def test_get_config_returns_raw_sensitive_values(self) -> None:
         payload = self.service.get_config(include_schema=True)
         items = {item["key"]: item for item in payload["items"]}
@@ -58,6 +63,158 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(items["GEMINI_API_KEY"]["value"], "secret-key-value")
         self.assertFalse(items["GEMINI_API_KEY"]["is_masked"])
         self.assertTrue(items["GEMINI_API_KEY"]["raw_value_exists"])
+
+    def test_get_setup_status_reports_required_gaps_for_empty_config(self) -> None:
+        self._rewrite_env("")
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        self.assertFalse(status["is_complete"])
+        self.assertFalse(status["ready_for_smoke"])
+        self.assertEqual(status["next_step_key"], "llm_primary")
+        self.assertIn("llm_primary", status["required_missing_keys"])
+        self.assertIn("stock_list", status["required_missing_keys"])
+
+    def test_get_setup_status_marks_minimal_config_complete(self) -> None:
+        self._rewrite_env(
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+            "GEMINI_API_KEY=secret-key-value",
+            "STOCK_LIST=600519",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        checks = {check["key"]: check for check in status["checks"]}
+        self.assertTrue(status["is_complete"])
+        self.assertTrue(status["ready_for_smoke"])
+        self.assertEqual(checks["llm_primary"]["status"], "configured")
+        self.assertEqual(checks["llm_agent"]["status"], "inherited")
+        self.assertEqual(checks["stock_list"]["status"], "configured")
+        self.assertEqual(checks["notification"]["status"], "optional")
+
+    def test_get_setup_status_accepts_anspire_one_key_llm(self) -> None:
+        self._rewrite_env(
+            "ANSPIRE_API_KEYS=sk-anspire-test-value",
+            "STOCK_LIST=600519",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        checks = {check["key"]: check for check in status["checks"]}
+        self.assertTrue(status["is_complete"])
+        self.assertEqual(checks["llm_primary"]["status"], "configured")
+        self.assertIn("openai/Doubao-Seed-2.0-lite", checks["llm_primary"]["message"])
+
+    def test_get_setup_status_treats_blank_anspire_channel_enabled_as_shared_disable(self) -> None:
+        self._rewrite_env(
+            "LLM_CHANNELS=anspire",
+            "LLM_ANSPIRE_ENABLED=",
+            "ANSPIRE_LLM_ENABLED=false",
+            "ANSPIRE_API_KEYS=sk-anspire-test-value",
+            "STOCK_LIST=600519",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        checks = {check["key"]: check for check in status["checks"]}
+        self.assertFalse(status["is_complete"])
+        self.assertEqual(checks["llm_primary"]["status"], "needs_action")
+        self.assertIn("llm_primary", status["required_missing_keys"])
+
+    def test_get_setup_status_respects_disabled_anspire_channel_without_legacy_fallback(self) -> None:
+        self._rewrite_env(
+            "LLM_CHANNELS=anspire",
+            "LLM_ANSPIRE_ENABLED=false",
+            "ANSPIRE_API_KEYS=sk-anspire-test-value",
+            "STOCK_LIST=600519",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        checks = {check["key"]: check for check in status["checks"]}
+        self.assertFalse(status["is_complete"])
+        self.assertEqual(checks["llm_primary"]["status"], "needs_action")
+        self.assertIn("llm_primary", status["required_missing_keys"])
+
+    def test_get_setup_status_accepts_direct_env_primary_without_provider_key(self) -> None:
+        self._rewrite_env(
+            "LITELLM_MODEL=minimax/MiniMax-M1",
+            "STOCK_LIST=600519",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        checks = {check["key"]: check for check in status["checks"]}
+        self.assertTrue(status["is_complete"])
+        self.assertEqual(checks["llm_primary"]["status"], "configured")
+        self.assertEqual(checks["llm_agent"]["status"], "inherited")
+
+    def test_get_setup_status_matches_notification_channel_requirements(self) -> None:
+        base_lines = [
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+            "GEMINI_API_KEY=secret-key-value",
+            "STOCK_LIST=600519",
+        ]
+
+        self._rewrite_env(*base_lines, "PUSHOVER_USER_KEY=user-key")
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+        pushover_partial = next(check for check in status["checks"] if check["key"] == "notification")
+        self.assertEqual(pushover_partial["status"], "optional")
+
+        self._rewrite_env(*base_lines, "PUSHOVER_USER_KEY=user-key", "PUSHOVER_API_TOKEN=app-token")
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+        pushover_complete = next(check for check in status["checks"] if check["key"] == "notification")
+        self.assertEqual(pushover_complete["status"], "configured")
+
+        self._rewrite_env(*base_lines, "SLACK_BOT_TOKEN=xoxb-test", "SLACK_CHANNEL_ID=C123")
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+        slack_complete = next(check for check in status["checks"] if check["key"] == "notification")
+        self.assertEqual(slack_complete["status"], "configured")
+
+    def test_get_setup_status_uses_runtime_env_without_reloading_singletons(self) -> None:
+        self._rewrite_env("")
+
+        with patch.dict(
+            os.environ,
+            {
+                "LITELLM_MODEL": "gemini/gemini-3-flash-preview",
+                "GEMINI_API_KEY": "runtime-secret",
+                "STOCK_LIST": "600519",
+            },
+            clear=True,
+        ), patch("src.services.system_config_service.Config.reset_instance") as mock_reset, \
+             patch("src.services.system_config_service.setup_env") as mock_setup_env:
+            status = self.service.get_setup_status()
+
+        self.assertTrue(status["is_complete"])
+        mock_reset.assert_not_called()
+        mock_setup_env.assert_not_called()
+
+    def test_get_setup_status_storage_check_does_not_create_database_parent(self) -> None:
+        missing_parent = Path(self.temp_dir.name) / "missing-data"
+        db_path = missing_parent / "stock_analysis.db"
+        self._rewrite_env(
+            "LITELLM_MODEL=gemini/gemini-3-flash-preview",
+            "GEMINI_API_KEY=secret-key-value",
+            "STOCK_LIST=600519",
+            f"DATABASE_PATH={db_path}",
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            status = self.service.get_setup_status()
+
+        storage_check = next(check for check in status["checks"] if check["key"] == "storage")
+        self.assertEqual(storage_check["status"], "configured")
+        self.assertFalse(missing_parent.exists())
 
     def test_export_desktop_env_returns_raw_text(self) -> None:
         self.env_path.write_text(
@@ -558,6 +715,51 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertFalse(any(issue.get("key") == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation.get("issues", [])))
 
+    def test_validate_accepts_cohere_model_as_direct_env_provider(self) -> None:
+        """cohere is NOT a managed key provider; it also uses LiteLLM direct-env routing."""
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "LLM_PRIMARY_ENABLED", "value": "false"},
+                {"key": "LITELLM_MODEL", "value": "cohere/command-r-plus"},
+            ]
+        )
+
+        self.assertFalse(any(issue.get("key") == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation.get("issues", [])))
+
+    def test_validate_accepts_google_model_as_direct_env_provider(self) -> None:
+        """google prefix is not managed by project key buckets and is kept as direct provider routing."""
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "LLM_PRIMARY_ENABLED", "value": "false"},
+                {"key": "LITELLM_MODEL", "value": "google/gemini-2.5-flash"},
+            ]
+        )
+
+        self.assertFalse(any(issue.get("key") == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation.get("issues", [])))
+
+    def test_validate_accepts_xai_model_as_direct_env_provider(self) -> None:
+        """xai is not a managed provider key and is also preserved as direct runtime source."""
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "primary"},
+                {"key": "LLM_PRIMARY_PROTOCOL", "value": "openai"},
+                {"key": "LLM_PRIMARY_API_KEY", "value": "sk-test-value"},
+                {"key": "LLM_PRIMARY_MODELS", "value": "gpt-4o-mini"},
+                {"key": "LLM_PRIMARY_ENABLED", "value": "false"},
+                {"key": "LITELLM_MODEL", "value": "xai/grok-beta"},
+            ]
+        )
+
+        self.assertFalse(any(issue.get("key") == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation.get("issues", [])))
+
     def test_validate_reports_stale_agent_primary_model_when_all_channels_disabled(self) -> None:
         validation = self.service.validate(
             items=[
@@ -589,6 +791,56 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertTrue(validation["valid"])
         self.assertEqual(validation["issues"], [])
 
+    def test_validate_allows_anspire_channel_with_shared_key_defaults(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "anspire"},
+                {"key": "ANSPIRE_API_KEYS", "value": "sk-anspire-test-value"},
+            ]
+        )
+
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_validate_treats_blank_anspire_channel_enabled_as_shared_disable(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "anspire"},
+                {"key": "LLM_ANSPIRE_ENABLED", "value": "   "},
+                {"key": "ANSPIRE_LLM_ENABLED", "value": "false"},
+            ]
+        )
+
+        self.assertTrue(validation["valid"], validation["issues"])
+        self.assertEqual(validation["issues"], [])
+
+    def test_validate_excludes_blank_disabled_anspire_channel_from_runtime_models(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "anspire"},
+                {"key": "LLM_ANSPIRE_ENABLED", "value": "   "},
+                {"key": "ANSPIRE_LLM_ENABLED", "value": "false"},
+                {"key": "ANSPIRE_API_KEYS", "value": "sk-anspire-test-value"},
+                {"key": "LITELLM_MODEL", "value": f"openai/{ANSPIRE_LLM_MODEL_DEFAULT}"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["key"] == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation["issues"]))
+
+    def test_validate_excludes_disabled_anspire_channel_from_legacy_runtime_source(self) -> None:
+        validation = self.service.validate(
+            items=[
+                {"key": "LLM_CHANNELS", "value": "anspire"},
+                {"key": "LLM_ANSPIRE_ENABLED", "value": "false"},
+                {"key": "ANSPIRE_API_KEYS", "value": "sk-anspire-test-value"},
+                {"key": "LITELLM_MODEL", "value": f"openai/{ANSPIRE_LLM_MODEL_DEFAULT}"},
+            ]
+        )
+
+        self.assertFalse(validation["valid"])
+        self.assertTrue(any(issue["key"] == "LITELLM_MODEL" and issue["code"] == "missing_runtime_source" for issue in validation["issues"]))
+
     @patch("litellm.completion")
     def test_test_llm_channel_returns_success_payload(self, mock_completion) -> None:
         mock_completion.return_value = type(
@@ -609,6 +861,41 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertTrue(payload["success"])
         self.assertEqual(payload["resolved_protocol"], "openai")
+        self.assertEqual(payload["resolved_model"], "openai/deepseek-chat")
+        self.assertEqual(payload["capability_results"], {})
+        self.assertEqual(mock_completion.call_count, 1)
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_falls_back_to_message_content_when_content_blocks_empty(
+        self,
+        mock_completion,
+    ) -> None:
+        mock_completion.return_value = type(
+            "MockResponse",
+            (),
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {
+                            "content_blocks": [],
+                            "message": type("Message", (), {"content": "OK"})(),
+                        },
+                    )(),
+                ]
+            },
+        )()
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.deepseek.com/v1",
+            api_key="sk-test-value",
+            models=["deepseek-chat"],
+        )
+
+        self.assertTrue(payload["success"])
         self.assertEqual(payload["resolved_model"], "openai/deepseek-chat")
 
     @patch("litellm.completion")
@@ -723,6 +1010,270 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertEqual(payload["resolved_model"], "openai/gpt-4o-mini")
         self.assertEqual(mock_completion.call_args.kwargs["temperature"], 0.42)
 
+    @patch("litellm.completion")
+    def test_test_llm_channel_classifies_common_failure_scenarios(self, mock_completion) -> None:
+        cases = [
+            (PermissionError("401 Unauthorized Bearer sk-secret-value"), "auth", "chat_completion", False),
+            (TimeoutError("request timed out"), "timeout", "chat_completion", True),
+            (Exception("404 model not found: gpt-4o-mini"), "model_not_found", "chat_completion", False),
+            (Exception("The model `gpt-4o-mini` does not exist"), "model_not_found", "chat_completion", False),
+            (Exception("404 Not Found: page not found"), "network_error", "chat_completion", False),
+            (
+                type("MockResponse", (), {"choices": [type("Choice", (), {"message": type("Message", (), {"content": ""})()})()]})(),
+                "empty_response",
+                "response_parse",
+                False,
+            ),
+            (object(), "format_error", "response_parse", False),
+        ]
+
+        for response_or_exc, error_code, stage, retryable in cases:
+            with self.subTest(error_code=error_code):
+                mock_completion.reset_mock()
+                if isinstance(response_or_exc, Exception):
+                    mock_completion.side_effect = response_or_exc
+                    mock_completion.return_value = None
+                else:
+                    mock_completion.side_effect = None
+                    mock_completion.return_value = response_or_exc
+
+                payload = self.service.test_llm_channel(
+                    name="primary",
+                    protocol="openai",
+                    base_url="https://api.example.com/v1",
+                    api_key="sk-secret-value",
+                    models=["gpt-4o-mini"],
+                )
+
+                self.assertFalse(payload["success"])
+                self.assertEqual(payload["error_code"], error_code)
+                self.assertEqual(payload["stage"], stage)
+                self.assertEqual(payload["retryable"], retryable)
+                if error_code == "auth":
+                    self.assertNotIn("sk-secret-value", payload["error"])
+                if error_code == "format_error":
+                    self.assertIn("choices", payload["error"])
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_marks_requested_capabilities_skipped_when_base_fails(self, mock_completion) -> None:
+        mock_completion.side_effect = PermissionError("401 Unauthorized Bearer sk-secret-value")
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-secret-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["json", "tools"],
+        )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "auth")
+        self.assertEqual(payload["details"]["reason"], "api_key_rejected")
+        self.assertEqual(payload["capability_results"]["json"]["status"], "skipped")
+        self.assertEqual(payload["capability_results"]["tools"]["details"]["reason"], "base_test_failed")
+        self.assertEqual(mock_completion.call_count, 1)
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_runs_json_and_tools_capability_checks(self, mock_completion) -> None:
+        tool_call = SimpleNamespace(function=SimpleNamespace(name="dsa_probe_echo"))
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            self._mock_completion_response('{"status":"ok"}'),
+            self._mock_completion_response("", tool_calls=[tool_call]),
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["tools", "json", "tools"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(list(payload["capability_results"].keys()), ["json", "tools"])
+        self.assertEqual(payload["capability_results"]["json"]["status"], "passed")
+        self.assertEqual(payload["capability_results"]["tools"]["status"], "passed")
+        self.assertEqual(mock_completion.call_count, 3)
+        self.assertEqual(mock_completion.call_args_list[1].kwargs["response_format"], {"type": "json_object"})
+        self.assertEqual(mock_completion.call_args_list[2].kwargs["tool_choice"]["function"]["name"], "dsa_probe_echo")
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_reports_json_capability_failures(self, mock_completion) -> None:
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            self._mock_completion_response("not json"),
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["json"],
+        )
+
+        self.assertTrue(payload["success"])
+        result = payload["capability_results"]["json"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "format_error")
+        self.assertEqual(result["details"]["reason"], "non_json")
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_runs_stream_capability_check_and_closes_stream(self, mock_completion) -> None:
+        class _Stream:
+            def __init__(self):
+                self.closed = False
+
+            def __iter__(self):
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="OK"))])
+
+            def close(self):
+                self.closed = True
+
+        stream = _Stream()
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            stream,
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["stream"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["capability_results"]["stream"]["status"], "passed")
+        self.assertTrue(stream.closed)
+        self.assertTrue(mock_completion.call_args_list[1].kwargs["stream"])
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_ignores_stream_close_failures(self, mock_completion) -> None:
+        class _Stream:
+            def __init__(self):
+                self.close_attempted = False
+
+            def __iter__(self):
+                yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="OK"))])
+
+            def close(self):
+                self.close_attempted = True
+                raise RuntimeError("transport already closed")
+
+        stream = _Stream()
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            stream,
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["stream"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["capability_results"]["stream"]["status"], "passed")
+        self.assertTrue(stream.close_attempted)
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_runs_vision_capability_check(self, mock_completion) -> None:
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            self._mock_completion_response("OK"),
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["vision"],
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["capability_results"]["vision"]["status"], "passed")
+        vision_content = mock_completion.call_args_list[1].kwargs["messages"][0]["content"]
+        self.assertEqual(vision_content[1]["type"], "image_url")
+        self.assertTrue(vision_content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_classifies_capability_unsupported(self, mock_completion) -> None:
+        mock_completion.side_effect = [
+            self._mock_completion_response("OK"),
+            Exception("response_format is not supported"),
+        ]
+
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key="sk-test-value",
+            models=["gpt-4o-mini"],
+            capability_checks=["json"],
+        )
+
+        result = payload["capability_results"]["json"]
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "capability_unsupported")
+        self.assertEqual(result["details"]["reason"], "capability_unsupported")
+
+    @patch("litellm.completion")
+    def test_test_llm_channel_adds_focused_diagnostic_reasons(self, mock_completion) -> None:
+        class RateLimitError(Exception):
+            pass
+
+        cases = [
+            (Exception("account balance insufficient"), "quota", "insufficient_balance"),
+            (RateLimitError("account balance insufficient"), "quota", "insufficient_balance"),
+            (RateLimitError("insufficient_quota"), "quota", "quota_exceeded"),
+            (Exception("DNS lookup failed"), "network_error", "dns_error"),
+            (Exception("TLS certificate verify failed"), "network_error", "tls_error"),
+            (Exception("Connection refused"), "network_error", "connection_refused"),
+            (Exception("model gpt-4o is not authorized for this account"), "model_not_found", "model_access_denied"),
+            (Exception("LLM Provider NOT provided for model foo"), "model_not_found", "provider_prefix_mismatch"),
+        ]
+
+        for exc, error_code, reason in cases:
+            with self.subTest(reason=reason):
+                mock_completion.reset_mock()
+                mock_completion.side_effect = exc
+                payload = self.service.test_llm_channel(
+                    name="primary",
+                    protocol="openai",
+                    base_url="https://api.example.com/v1",
+                    api_key="sk-test-value",
+                    models=["gpt-4o-mini"],
+                )
+
+                self.assertFalse(payload["success"])
+                self.assertEqual(payload["error_code"], error_code)
+                self.assertEqual(payload["details"]["reason"], reason)
+
+    def test_test_llm_channel_reports_comma_only_api_key_as_missing(self) -> None:
+        payload = self.service.test_llm_channel(
+            name="primary",
+            protocol="openai",
+            base_url="https://api.example.com/v1",
+            api_key=", ,",
+            models=["gpt-4o-mini"],
+        )
+
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "invalid_config")
+        self.assertEqual(payload["details"]["reason"], "missing_api_key")
+
     @patch("src.services.system_config_service.requests.get")
     def test_discover_llm_channel_models_returns_deduped_ids(self, mock_get) -> None:
         mock_response = Mock()
@@ -757,6 +1308,49 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             "Bearer sk-test-value",
         )
         self.assertFalse(mock_get.call_args.kwargs["allow_redirects"])
+
+    @patch("src.services.system_config_service.requests.get")
+    def test_discover_llm_channel_models_classifies_error_scenarios(self, mock_get) -> None:
+        auth_response = Mock(ok=False, status_code=401, text="invalid api key sk-secret-value")
+        auth_response.json.return_value = {"error": {"message": "invalid api key sk-secret-value"}}
+        not_found_response = Mock(ok=False, status_code=404, text="not found")
+        not_found_response.json.return_value = {"error": {"message": "not found"}}
+        billing_response = Mock(ok=False, status_code=402, text="account balance insufficient")
+        billing_response.json.return_value = {"error": {"message": "account balance insufficient"}}
+        billing_rate_limit_response = Mock(ok=False, status_code=429, text="account balance insufficient")
+        billing_rate_limit_response.json.return_value = {"error": {"message": "account balance insufficient"}}
+        quota_exceeded_response = Mock(ok=False, status_code=429, text="insufficient_quota")
+        quota_exceeded_response.json.return_value = {"error": {"message": "insufficient_quota"}}
+        rate_limit_response = Mock(ok=False, status_code=429, text="too many requests")
+        rate_limit_response.json.return_value = {"error": {"message": "too many requests"}}
+        invalid_json_response = Mock(ok=True, status_code=200, text="<html>bad gateway</html>")
+        invalid_json_response.json.side_effect = ValueError("invalid json")
+
+        for response, error_code, stage, retryable, reason in [
+            (auth_response, "auth", "model_discovery", False, "api_key_rejected"),
+            (not_found_response, "network_error", "model_discovery", False, "endpoint_not_found"),
+            (billing_response, "quota", "model_discovery", True, "insufficient_balance"),
+            (billing_rate_limit_response, "quota", "model_discovery", True, "insufficient_balance"),
+            (quota_exceeded_response, "quota", "model_discovery", True, "quota_exceeded"),
+            (rate_limit_response, "quota", "model_discovery", True, "rate_limit"),
+            (invalid_json_response, "format_error", "response_parse", False, "non_json"),
+        ]:
+            with self.subTest(error_code=error_code):
+                mock_get.return_value = response
+                payload = self.service.discover_llm_channel_models(
+                    name="dashscope",
+                    protocol="openai",
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    api_key="sk-secret-value",
+                )
+
+                self.assertFalse(payload["success"])
+                self.assertEqual(payload["error_code"], error_code)
+                self.assertEqual(payload["stage"], stage)
+                self.assertEqual(payload["retryable"], retryable)
+                self.assertEqual(payload["details"]["reason"], reason)
+                if error_code == "auth":
+                    self.assertNotIn("sk-secret-value", payload["error"])
 
     @patch("src.services.system_config_service.requests.get")
     def test_discover_llm_channel_models_rejects_redirect_responses(self, mock_get) -> None:
@@ -821,6 +1415,18 @@ class SystemConfigServiceTestCase(unittest.TestCase):
 
         self.assertFalse(validation["valid"])
         self.assertTrue(any(issue["code"] == "invalid_event_rule" for issue in validation["issues"]))
+
+    def test_validate_accepts_price_change_percent_event_rule(self) -> None:
+        validation = self.service.validate(items=[{
+            "key": "AGENT_EVENT_ALERT_RULES_JSON",
+            "value": (
+                '[{"stock_code":"300750","alert_type":"price_change_percent",'
+                '"direction":"down","change_pct":3.0}]'
+            ),
+        }])
+
+        self.assertTrue(validation["valid"])
+        self.assertEqual(validation["issues"], [])
 
     def test_validate_rejects_unsupported_event_rule_type(self) -> None:
         validation = self.service.validate(items=[{
@@ -921,6 +1527,90 @@ class SystemConfigServiceTestCase(unittest.TestCase):
         self.assertIn("不会自动重建 scheduler", schedule_warning)
         self.assertIn("以 schedule 模式重新启动后生效", schedule_warning)
         self.assertNotIn("它属于启动期单次运行配置", schedule_warning)
+
+    def test_update_warns_when_runtime_model_references_are_cleared(self) -> None:
+        self._rewrite_env(
+            "STOCK_LIST=600519,000001",
+            "LLM_CHANNELS=deepseek",
+            "LLM_DEEPSEEK_PROTOCOL=deepseek",
+            "LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com",
+            "LLM_DEEPSEEK_API_KEY=sk-test-value",
+            "LLM_DEEPSEEK_MODELS=deepseek-chat,deepseek-v4-flash,deepseek-v4-pro",
+            "LITELLM_MODEL=deepseek/deepseek-chat",
+            "AGENT_LITELLM_MODEL=deepseek/deepseek-v4-pro",
+            "LITELLM_FALLBACK_MODELS=deepseek/deepseek-v4-pro,deepseek/deepseek-chat,cohere/command-r-plus",
+            "VISION_MODEL=deepseek/deepseek-v4-flash",
+        )
+
+        response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[
+                {"key": "LLM_DEEPSEEK_MODELS", "value": "deepseek-v4-flash,deepseek-v4-pro"},
+                {"key": "LITELLM_MODEL", "value": ""},
+                {"key": "AGENT_LITELLM_MODEL", "value": ""},
+                {"key": "LITELLM_FALLBACK_MODELS", "value": "deepseek/deepseek-v4-pro,cohere/command-r-plus"},
+                {"key": "VISION_MODEL", "value": ""},
+            ],
+            reload_now=False,
+        )
+
+        self.assertTrue(response["success"])
+        warning = next(
+            warning
+            for warning in response["warnings"]
+            if "已同步清理失效的运行时模型引用" in warning
+        )
+        self.assertIn("主模型 / Agent 主模型 / Vision 模型 / 备选模型中的失效项", warning)
+        self.assertIn("桌面端导出备份", warning)
+
+    def test_import_desktop_env_restores_runtime_models_after_cleanup(self) -> None:
+        self._rewrite_env(
+            "STOCK_LIST=600519,000001",
+            "LLM_CHANNELS=deepseek",
+            "LLM_DEEPSEEK_PROTOCOL=deepseek",
+            "LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com",
+            "LLM_DEEPSEEK_API_KEY=sk-test-value",
+            "LLM_DEEPSEEK_MODELS=deepseek-chat,deepseek-v4-flash,deepseek-v4-pro",
+            "LITELLM_MODEL=deepseek/deepseek-chat",
+            "AGENT_LITELLM_MODEL=deepseek/deepseek-v4-pro",
+            "LITELLM_FALLBACK_MODELS=deepseek/deepseek-v4-pro,deepseek/deepseek-chat,cohere/command-r-plus",
+            "VISION_MODEL=deepseek/deepseek-v4-flash",
+        )
+
+        backup_content = self.service.export_desktop_env()["content"]
+        pre_clear_map = dict(self.manager.read_config_map())
+
+        clear_response = self.service.update(
+            config_version=self.manager.get_config_version(),
+            items=[
+                {"key": "LLM_DEEPSEEK_MODELS", "value": "deepseek-v4-flash"},
+                {"key": "LITELLM_MODEL", "value": ""},
+                {"key": "AGENT_LITELLM_MODEL", "value": ""},
+                {"key": "LITELLM_FALLBACK_MODELS", "value": "deepseek/deepseek-v4-flash"},
+                {"key": "VISION_MODEL", "value": ""},
+            ],
+            reload_now=False,
+        )
+        self.assertTrue(clear_response["success"])
+
+        cleared_map = self.manager.read_config_map()
+        self.assertEqual(cleared_map["LITELLM_MODEL"], "")
+        self.assertEqual(cleared_map["AGENT_LITELLM_MODEL"], "")
+        self.assertEqual(cleared_map["VISION_MODEL"], "")
+        self.assertEqual(cleared_map["LITELLM_FALLBACK_MODELS"], "deepseek/deepseek-v4-flash")
+
+        restore_payload = self.service.import_desktop_env(
+            config_version=self.manager.get_config_version(),
+            content=backup_content,
+            reload_now=False,
+        )
+        self.assertTrue(restore_payload["success"])
+
+        restored_map = self.manager.read_config_map()
+        self.assertEqual(restored_map["LITELLM_MODEL"], pre_clear_map["LITELLM_MODEL"])
+        self.assertEqual(restored_map["AGENT_LITELLM_MODEL"], pre_clear_map["AGENT_LITELLM_MODEL"])
+        self.assertEqual(restored_map["VISION_MODEL"], pre_clear_map["VISION_MODEL"])
+        self.assertEqual(restored_map["LITELLM_FALLBACK_MODELS"], pre_clear_map["LITELLM_FALLBACK_MODELS"])
 
 
     def test_validate_rejects_comma_only_api_key(self) -> None:
